@@ -9,3 +9,6 @@ build/
 *.key
 *.cnf
 *_client.yaml
+# 本机运行日志（部署分支新增）
+*.log
+*.log.*
