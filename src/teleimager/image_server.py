@@ -534,14 +534,9 @@ class WebRTC_PublisherManager:
 # UVC driver reload
 # ========================================================
 def reload_uvc_driver():
-    try:
-        subprocess.run("sudo modprobe -r uvcvideo", shell=True, check=True)
-        time.sleep(1)
-        subprocess.run("sudo modprobe uvcvideo debug=0", shell=True, check=True)
-        time.sleep(1)
-        logger_mp.info("UVC driver reloaded successfully.")
-    except subprocess.CalledProcessError as e:
-        logger_mp.error(f"Failed to reload driver: {e}")
+    # pyuvc uses libusb. Missing V4L2 nodes do not mean that the camera is absent.
+    # Never unload a global driver here: it also owns the active D435i.
+    logger_mp.info("UVC global reload disabled; resolve cameras by USB physical path and UID.")
 
 # ========================================================
 # camera finder and cameras
@@ -568,7 +563,7 @@ class CameraFinder:
         if realsense_enable:
             self.rs_serial_numbers = self._list_realsense_serial_numbers()
             self.rs_video_paths = self._list_realsense_video_paths()
-            self.rs_rgb_video_paths = [p for p in self.rs_video_paths if self._is_like_rgb(p)]
+            self.rs_rgb_video_paths = [p for p in self.rs_video_paths if self._is_uvc_candidate(p)]
         else:
             self.rs_serial_numbers = []
             self.rs_video_paths = []
@@ -608,7 +603,7 @@ class CameraFinder:
         return [f"/dev/{x}" for x in sorted(os.listdir(base)) if x.startswith("video")]
 
     def _list_uvc_rgb_video_paths(self):
-        return [p for p in self.video_paths if self._is_like_rgb(p) and p not in self.rs_video_paths]
+        return [p for p in self.video_paths if self._is_uvc_candidate(p) and p not in self.rs_video_paths]
 
     def _list_realsense_video_paths(self):
         def _read_text(path):
@@ -710,13 +705,18 @@ class CameraFinder:
             return f"{bus}:{dev}"
         return None
 
-    def _is_like_rgb(self, video_path):
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            return False
-        ret, frame = cap.read()
-        cap.release()
-        return ret and frame is not None and frame.ndim == 3 and frame.shape[2] == 3
+    def _is_uvc_candidate(self, video_path, attempts: int = 3):
+        # 只确认节点可见，不读帧（避免与 pyuvc 抢设备）；打不开也保留
+        # （D435i 运行时 cv2 无法打开腕部节点）。最终选哪台由
+        # cam_config_server.yaml 的 physical_path 精确匹配。
+        for attempt in range(max(1, attempts)):
+            cap = cv2.VideoCapture(video_path)
+            opened = cap.isOpened()
+            cap.release()
+            if opened:
+                return True
+            time.sleep(0.2)
+        return True
 
     # --------------------------------------------------------
     # public api
@@ -745,6 +745,12 @@ class CameraFinder:
         return matches[0].get("uid")
 
     def get_uid_by_ppath(self, physical_path):
+        # libusb may claim the interface and remove its /dev/video nodes.
+        # Resolve the configured USB port directly, then require that exact UID
+        # to be present in pyuvc's enumeration. Never fall back to another camera.
+        uid = self._get_uid_from_ppath(physical_path)
+        if uid is not None and uid in self.uid_map:
+            return uid
         for cam in self.uvc_rgb_cameras.values():
             if cam.get("physical_path") == physical_path:
                 return cam.get("uid")
@@ -775,7 +781,7 @@ class CameraFinder:
             sys_path = os.path.realpath(os.path.join(base, v, "device"))
             if sys_path == physical_path:
                 vpath = f"/dev/{v}"
-                if self._is_like_rgb(vpath):
+                if self._is_uvc_candidate(vpath):
                     matches.append(vpath)
         if not matches:
             return None
@@ -868,6 +874,9 @@ class BaseCamera:
     def get_jpeg_bytes(self):
         jpeg_bytes = self._zmq_buffer.read() if self._enable_zmq and self._zmq_buffer else None
         return jpeg_bytes
+
+    def get_frame_sequence(self):
+        return None
 
     def get_bgr_frame(self):
         bgr_numpy = self._webrtc_buffer.read() if self._enable_webrtc and self._webrtc_buffer else None
@@ -1004,6 +1013,7 @@ class UVCCamera(BaseCamera):
         import uvc
         self.uid = uid
         self.cap = None
+        self._frame_sequence = 0
         try:
             self.cap = uvc.Capture(self.uid)
         except Exception as e:
@@ -1016,6 +1026,9 @@ class UVCCamera(BaseCamera):
         except Exception as e:
             self.cap = None
             raise RuntimeError(f"[UVCCamera] Failed to set mode for {self._cam_topic}: {e}")
+
+    def get_frame_sequence(self):
+        return self._frame_sequence
 
     def __str__(self):
         return (
@@ -1033,11 +1046,25 @@ class UVCCamera(BaseCamera):
 
     def _update_frame(self):
         if self.cap is not None:
-            frame = self.cap.get_frame_robust() # get_frame(timeout=500)
+            # pyuvc 的 timeout 单位是秒；1.0 表示最多等待一秒。超时期间
+            # 不更新共享缓冲区，发布线程也不会把上一张 JPEG 冒充新帧。
+            try:
+                frame = self.cap.get_frame(timeout=1.0)
+            except TimeoutError:
+                self._miss_count = getattr(self, "_miss_count", 0) + 1
+                if self._miss_count >= 30:
+                    raise RuntimeError(
+                        f"[UVCCamera] {self._cam_topic}: "
+                        f"{self._miss_count} consecutive frame timeouts"
+                    ) from None
+                return
+
+            self._miss_count = 0
             if frame is not None:
                 if self._enable_zmq:
                     if frame.jpeg_buffer is not None:
                         self._zmq_buffer.write(bytes(frame.jpeg_buffer))
+                        self._frame_sequence += 1
 
                 if self._enable_webrtc:
                     if frame.bgr is not None:
@@ -1045,8 +1072,6 @@ class UVCCamera(BaseCamera):
 
                 if not self._ready.is_set():
                     self._ready.set()
-            else:
-                raise RuntimeError
 
     def release(self):
         # if usbhub is plugged out, calling stop_streaming and close may hang forever.
@@ -1354,11 +1379,18 @@ class ImageServer:
         try:
             interval = 1.0 / camera.get_fps()
             next_frame_time = time.monotonic()
+            last_published = None
 
             while not self._stop_event.is_set():
                 jpeg_bytes = camera.get_jpeg_bytes()
                 if jpeg_bytes is not None:
-                    self._zmq_publisher_manager.publish(jpeg_bytes, camera.get_zmq_port())
+                    # Do not repeat a buffered frame after acquisition stalls.
+                    # Equal JPEG bytes can still be distinct valid frames of a
+                    # static scene, so track acquisition generations instead.
+                    sequence = camera.get_frame_sequence()
+                    if sequence is None or sequence != last_published:
+                        self._zmq_publisher_manager.publish(jpeg_bytes, camera.get_zmq_port())
+                        last_published = sequence
                 else:
                     logger_mp.warning(f"[Image Server] {cam_topic} returned no frame.")
                     self._stop_event.set()

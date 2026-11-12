@@ -1,17 +1,16 @@
 # =====================================================
-# 本文件由 g1-mcap-capture 于 2026-10-21 修改（仅配置，未改代码）
-# 原文件备份: cam_config_server.yaml.bak.20261021
-# 回滚:  cp ~/teleimager/cam_config_server.yaml.bak.20261021 ~/teleimager/cam_config_server.yaml
+# teleimager 1.5 相机配置（仓库内的权威副本）
 #
-# 修改原因:
-#   1) 头部双目尚未安装，1-3.1 无设备。v1.5.0 的 ImageServer.start() 只要
-#      任何一路相机解析失败(None)就整体退出，因此未装的相机必须两个
-#      enable 都为 false（此时该路被完全跳过）。
-#   2) 双腕相机此前被 disable，导致 55556/55557 不发布。
-#   3) 两个腕部相机序列号相同(200901010001)，必须靠 physical_path 区分：
-#        1-3.3 -> libuvc uid 1:6   (左腕, /dev/video8)
-#        1-3.2 -> libuvc uid 1:5   (右腕, /dev/video6)
-#      实测确认于 2026-10-21。
+# 部署：scripts/install_teleimager_config.sh
+#   1) 复制到 <teleimager 目录>/cam_config_server.yaml
+#   2) 复制后按 USB VID:PID 自动回写 physical_path（scripts/sync_camera_paths.py），
+#      所以下面的 physical_path 只是本机示例，换机器/换口无需手改
+#   3) 改完需 systemctl --user restart g1-teleimager
+#
+# 三路相机：头部双目 1bcf:2d4f / 左腕 0edc:2b10 / 右腕 1e45:2050。
+# 两只腕部相机序列号相同（200901010001），只能靠 physical_path（USB 物理端口）区分；
+# /dev/videoN 会随驱动重载变化，因此不依赖它。
+# 头部开关由 scripts/set_head_source.sh 维护：stereo 时 head 的 enable_zmq/webrtc=true。
 # =====================================================
 
 # =====================================================
@@ -55,7 +54,7 @@ head_camera:
 
   # if enable_zmq and enable_webrtc are both false, the camera will not start
   # Set to true to enable ZMQ publishing, false to disable
-  # 2026-10-21: 头部双目未安装 -> 两路均关闭，跳过该相机。
+  # stereo 模式下启用头部双目；d435i 模式由 scripts/set_head_source.sh 关闭。
   enable_zmq: true
   # Port to publish camera stream, e.g. zmq tcp://*:55555.  image_client.py should connect to the same port
   zmq_port : 55555

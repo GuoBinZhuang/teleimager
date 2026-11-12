@@ -12,3 +12,8 @@ build/
 # 本机运行日志（部署分支新增）
 *.log
 *.log.*
+
+# 临时备份与补丁残留
+*.bak-*
+*.rej
+patch-backups/
