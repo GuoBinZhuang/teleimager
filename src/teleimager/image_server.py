@@ -865,6 +865,16 @@ class BaseCamera:
         """Block until the camera is ready (first frame is available) or timeout occurs."""
         return self._ready.wait(timeout=timeout)
 
+    def reopen(self):
+        """Try to re-acquire the device after a dropout.
+
+        Returns:
+            True  -> re-acquired, frames should flow again
+            False -> tried but failed
+            None  -> reopening is not supported by this camera type
+        """
+        return None
+
     def enable_webrtc(self):
         return self._enable_webrtc
     
@@ -1008,14 +1018,21 @@ class RealSenseCamera(BaseCamera):
 
 class UVCCamera(BaseCamera):
     def __init__(self, cam_topic, uid, img_shape, fps, 
-                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None):
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None,
+                 uid_resolver=None):
         super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
-        import uvc
         self.uid = uid
         self.cap = None
         self._frame_sequence = 0
+        self._miss_count = 0
+        # USB 掉线重枚举后 uid（bus:dev）会变，需要按 physical_path 重新解析。
+        self._uid_resolver = uid_resolver
+        self._open(uid)
+
+    def _open(self, uid):
+        import uvc
         try:
-            self.cap = uvc.Capture(self.uid)
+            self.cap = uvc.Capture(uid)
         except Exception as e:
             self.cap = None
             raise RuntimeError(f"[UVCCamera] Failed to open camera {self._cam_topic}: {e}")
@@ -1026,6 +1043,25 @@ class UVCCamera(BaseCamera):
         except Exception as e:
             self.cap = None
             raise RuntimeError(f"[UVCCamera] Failed to set mode for {self._cam_topic}: {e}")
+
+    def reopen(self):
+        """重开 UVC 设备；True=成功，False=尝试过但失败。"""
+        self._miss_count = 0
+        uid = None
+        if self._uid_resolver is not None:
+            try:
+                uid = self._uid_resolver()
+            except Exception as e:
+                logger_mp.error(f"[UVCCamera] {self._cam_topic}: uid re-resolve failed: {e}")
+        if uid is None:
+            uid = self.uid
+        try:
+            self._open(uid)
+        except Exception:
+            return False
+        self.uid = uid
+        self._ready.clear()
+        return True
 
     def get_frame_sequence(self):
         return self._frame_sequence
@@ -1225,12 +1261,25 @@ class IsaacSimCamera(BaseCamera):
 # image server
 # ========================================================
 class ImageServer:
+    def _make_camera(self, factory, cam_topic, *args, **kwargs):
+        """构造单台相机：失败只影响它自己，不拖垮整个 image server。"""
+        try:
+            # 所有相机类的第一个位置参数都是 cam_topic
+            return factory(cam_topic, *args, **kwargs)
+        except Exception as e:
+            logger_mp.error(f"[Image Server] Camera {cam_topic} initialization failed: {e}")
+            return None
+
     def __init__(self, cam_config, realsense_enable=False, camera_finder_verbose=False, isaacsim_enable=False):
         self._cam_config = cam_config
         self._realsense_enable = realsense_enable
         self._isaacsim_enable = isaacsim_enable
         self._stop_event = threading.Event()
         self._cameras: dict[str, BaseCamera] = {}
+        # 每台相机独立的“采集健康”事件：单相机故障只清掉自己的事件，
+        # 不触碰全局 _stop_event，因此不会影响其它相机的推流。
+        self._alive: dict[str, threading.Event] = {}
+        self._alive_lock = threading.Lock()
         if not self._isaacsim_enable:
             self._cam_finder = CameraFinder(realsense_enable, camera_finder_verbose)
         self._responser = ZMQ_Responser(self._cam_config)
@@ -1266,8 +1315,9 @@ class ImageServer:
                             self._cameras[cam_topic] = None
                             logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with physical path {physical_path}")
                         else:
-                            self._cameras[cam_topic] = OpenCVCamera(cam_topic, vpath, img_shape, fps, 
-                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                            self._cameras[cam_topic] = self._make_camera(
+                                OpenCVCamera, cam_topic, vpath, img_shape, fps,
+                                enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
                             continue
 
                     if serial_number is not None:
@@ -1276,8 +1326,9 @@ class ImageServer:
                             self._cameras[cam_topic] = None
                             logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with serial number {serial_number}")
                         else:
-                            self._cameras[cam_topic] = OpenCVCamera(cam_topic, vpath, img_shape, fps, 
-                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                            self._cameras[cam_topic] = self._make_camera(
+                                OpenCVCamera, cam_topic, vpath, img_shape, fps,
+                                enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
                         # once you specify either `physical_path` or `serial_number`, the system will no longer fall back to searching by `video_id`.
                         # ——— even if no camera matches the given path/serial.
                         continue
@@ -1286,8 +1337,9 @@ class ImageServer:
                         self._cameras[cam_topic] = None
                         logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with video_id {video_id}")
                     else:
-                        self._cameras[cam_topic] = OpenCVCamera(cam_topic, video_path, img_shape, fps,
-                                                                enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                        self._cameras[cam_topic] = self._make_camera(
+                            OpenCVCamera, cam_topic, video_path, img_shape, fps,
+                            enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
                         
 
                 elif cam_type == "realsense":
@@ -1298,8 +1350,9 @@ class ImageServer:
                         self._cameras[cam_topic] = None
                         logger_mp.error(f"[Image Server] Cannot find RealSenseCamera for {cam_topic}")
                     else:
-                        self._cameras[cam_topic] = RealSenseCamera(cam_topic, serial_number, img_shape, fps,
-                                                                   enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                        self._cameras[cam_topic] = self._make_camera(
+                            RealSenseCamera, cam_topic, serial_number, img_shape, fps,
+                            enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
 
                 elif cam_type == "uvc":
                     uid = None
@@ -1309,8 +1362,11 @@ class ImageServer:
                             self._cameras[cam_topic] = None
                             logger_mp.error(f"[Image Server] Cannot find UVCCamera for {cam_topic} with physical path {physical_path}")
                         else:
-                            self._cameras[cam_topic] = UVCCamera(cam_topic, uid, img_shape, fps, 
-                                                                 enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                            # uid_resolver：USB 重新枚举后按 physical_path 重新解析 uid，用于掉线重开
+                            self._cameras[cam_topic] = self._make_camera(
+                                UVCCamera, cam_topic, uid, img_shape, fps,
+                                enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                                uid_resolver=functools.partial(self._cam_finder.get_uid_by_ppath, physical_path))
                             continue
 
                     if serial_number is not None:
@@ -1319,8 +1375,10 @@ class ImageServer:
                             self._cameras[cam_topic] = None
                             logger_mp.error(f"[Image Server] Cannot find UVCCamera for {cam_topic} with serial number {serial_number}")
                         else:
-                            self._cameras[cam_topic] = UVCCamera(cam_topic, uid, img_shape, fps, 
-                                                                 enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                            self._cameras[cam_topic] = self._make_camera(
+                                UVCCamera, cam_topic, uid, img_shape, fps,
+                                enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                                uid_resolver=functools.partial(self._cam_finder.get_uid_by_sn, serial_number))
                         # once you specify either `physical_path` or `serial_number`, the system will no longer fall back to searching by `video_id`.
                         # ——— even if no camera matches the given path/serial.
                         continue
@@ -1341,95 +1399,149 @@ class ImageServer:
                         else:
                             image_source = "head"  # fallback
 
-                    self._cameras[cam_topic] = IsaacSimCamera(cam_topic, img_shape, fps,
-                                                                enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
-                                                                image_source=image_source, binocular=binocular)
+                    self._cameras[cam_topic] = self._make_camera(
+                        IsaacSimCamera, cam_topic, img_shape, fps,
+                        enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                        image_source=image_source, binocular=binocular)
                 else:
                     logger_mp.error(f"[Image Server] Unknown camera type {cam_type} for {cam_topic}, skipping...")
                     continue
         except Exception as e:
+            # 单台相机或单次探测异常不再把整个进程带走：记录后继续，
+            # 由 start() 判断是否还有可用相机。
             logger_mp.error(f"[Image Server] Initialization failed: {e}")
-            self._clean_up()
-            raise
 
         logger_mp.info("[Image Server] Image server has started, waiting for client connections...")
 
-    def _update_frames(self, cam_topic: str, camera: BaseCamera):
-        try:
-            interval = 1.0 / camera.get_fps()
-            next_frame_time = time.monotonic()
-            while not self._stop_event.is_set():
+    def _alive_for(self, cam_topic: str) -> threading.Event:
+        with self._alive_lock:
+            return self._alive.setdefault(cam_topic, threading.Event())
+
+    def _recover_camera(self, cam_topic: str, camera: BaseCamera) -> bool:
+        """退避地尝试把单台相机拉回来。
+
+        返回 False 表示服务正在退出；返回 True 表示设备已重新打开/重新出帧。
+        整个过程只影响这一台相机，其它相机继续推流。
+        """
+        backoff = 1.0
+        attempt = 0
+        last_report = 0.0
+        while not self._stop_event.is_set():
+            attempt += 1
+            reopened = camera.reopen()
+            if reopened is True:
+                logger_mp.info(f"[Image Server] {cam_topic} reopened after {attempt} attempt(s); resuming.")
+                return True
+            if reopened is None:
+                # 该相机类型不支持 reopen，退化成重试读帧。
                 try:
                     camera._update_frame()
-                except Exception as e:
-                    logger_mp.error(f"[Image Server] Error updating frame for {cam_topic} camera")
-                    self._stop_event.set()
-                    break
-                next_frame_time += interval
-                sleep_time = next_frame_time - time.monotonic()
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                else:
-                    next_frame_time = time.monotonic()
-        except Exception as e:
-            logger_mp.error(f"[Image Server] Failed to update frames for {cam_topic} camera: {e}")
-            self._stop_event.set()
+                    logger_mp.info(f"[Image Server] {cam_topic} recovered without reopen; resuming.")
+                    return True
+                except Exception:
+                    pass
+            now = time.monotonic()
+            if now - last_report >= 30.0:
+                last_report = now
+                logger_mp.warning(
+                    f"[Image Server] {cam_topic} still unavailable (attempt {attempt}); "
+                    f"retrying with backoff up to 30s. Other cameras are unaffected."
+                )
+            if self._stop_event.wait(backoff):
+                return False
+            backoff = min(30.0, backoff * 2.0)
+        return False
+
+    def _update_frames(self, cam_topic: str, camera: BaseCamera):
+        """单相机采集循环。
+
+        单相机故障（USB 掉线、读帧超时、设备重新枚举）只影响本相机：
+        这里会隔离该相机并按退避重试/重开设备，**绝不** set 全局 _stop_event。
+        """
+        interval = 1.0 / max(1.0, camera.get_fps())
+        alive = self._alive_for(cam_topic)
+        next_frame_time = time.monotonic()
+        while not self._stop_event.is_set():
+            try:
+                camera._update_frame()
+            except Exception as e:
+                alive.clear()
+                logger_mp.error(
+                    f"[Image Server] {cam_topic} acquisition failed ({type(e).__name__}: {e}); "
+                    f"isolating this camera, the other cameras keep running."
+                )
+                if not self._recover_camera(cam_topic, camera):
+                    return
+                next_frame_time = time.monotonic()
+                continue
+
+            if not alive.is_set():
+                alive.set()
+                logger_mp.info(f"[Image Server] {cam_topic} is publishing frames again.")
+
+            next_frame_time += interval
+            sleep_time = next_frame_time - time.monotonic()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                next_frame_time = time.monotonic()
 
     def _zmq_pub(self, cam_topic: str, camera: BaseCamera):
-        try:
-            interval = 1.0 / camera.get_fps()
-            next_frame_time = time.monotonic()
-            last_published = None
+        interval = 1.0 / max(1.0, camera.get_fps())
+        alive = self._alive_for(cam_topic)
+        next_frame_time = time.monotonic()
+        last_published = None
+        last_warn = 0.0
 
-            while not self._stop_event.is_set():
-                jpeg_bytes = camera.get_jpeg_bytes()
-                if jpeg_bytes is not None:
-                    # Do not repeat a buffered frame after acquisition stalls.
-                    # Equal JPEG bytes can still be distinct valid frames of a
-                    # static scene, so track acquisition generations instead.
-                    sequence = camera.get_frame_sequence()
-                    if sequence is None or sequence != last_published:
-                        self._zmq_publisher_manager.publish(jpeg_bytes, camera.get_zmq_port())
-                        last_published = sequence
-                else:
-                    logger_mp.warning(f"[Image Server] {cam_topic} returned no frame.")
-                    self._stop_event.set()
-                    break
+        while not self._stop_event.is_set():
+            try:
+                # 相机不在健康状态时安静等待，不反复发旧帧，也不拖垮其它相机。
+                if alive.is_set():
+                    jpeg_bytes = camera.get_jpeg_bytes()
+                    if jpeg_bytes is not None:
+                        # Do not repeat a buffered frame after acquisition stalls.
+                        # Equal JPEG bytes can still be distinct valid frames of a
+                        # static scene, so track acquisition generations instead.
+                        sequence = camera.get_frame_sequence()
+                        if sequence is None or sequence != last_published:
+                            self._zmq_publisher_manager.publish(jpeg_bytes, camera.get_zmq_port())
+                            last_published = sequence
+                    else:
+                        now = time.monotonic()
+                        if now - last_warn >= 5.0:
+                            last_warn = now
+                            logger_mp.warning(f"[Image Server] {cam_topic} returned no frame; waiting for this camera only.")
+            except Exception as e:
+                logger_mp.error(f"[Image Server] zmq publish error from {cam_topic}: {type(e).__name__}: {e}")
 
-                next_frame_time += interval
-                sleep_time = next_frame_time - time.monotonic()
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                else:
-                    next_frame_time = time.monotonic()
-        except Exception as e:
-            logger_mp.error(f"[Image Server] Failed to publish zmq frame from {cam_topic} camera.")
-            self._stop_event.set()
+            next_frame_time += interval
+            sleep_time = next_frame_time - time.monotonic()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                next_frame_time = time.monotonic()
     
     def _webrtc_pub(self, cam_topic: str, camera: BaseCamera):
-        try:
-            interval = 1.0 / camera.get_fps()
-            webrtc_codec = camera.get_webrtc_codec()
-            next_frame_time = time.monotonic()
-            while not self._stop_event.is_set():
-                bgr_frame = camera.get_bgr_frame()
+        interval = 1.0 / max(1.0, camera.get_fps())
+        alive = self._alive_for(cam_topic)
+        webrtc_codec = camera.get_webrtc_codec()
+        next_frame_time = time.monotonic()
 
-                if bgr_frame is not None:
-                    self._webrtc_publisher_manager.publish(bgr_frame, camera.get_webrtc_port(), codec_pref=webrtc_codec)
-                else:
-                    logger_mp.info(f"[Image Server] {cam_topic} returned no frame.")
-                    self._stop_event.set()
-                    break
+        while not self._stop_event.is_set():
+            try:
+                if alive.is_set():
+                    bgr_frame = camera.get_bgr_frame()
+                    if bgr_frame is not None:
+                        self._webrtc_publisher_manager.publish(bgr_frame, camera.get_webrtc_port(), codec_pref=webrtc_codec)
+            except Exception as e:
+                logger_mp.error(f"[Image Server] webrtc publish error from {cam_topic}: {type(e).__name__}: {e}")
 
-                next_frame_time += interval
-                sleep_time = next_frame_time - time.monotonic()
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                else:
-                    next_frame_time = time.monotonic()
-        except Exception as e:
-            logger_mp.error(f"[Image Server] Failed to publish rtc frame from {cam_topic} camera.")
-            self._stop_event.set()
+            next_frame_time += interval
+            sleep_time = next_frame_time - time.monotonic()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                next_frame_time = time.monotonic()
 
     def _clean_up(self):
         self._responser.stop()
@@ -1459,41 +1571,68 @@ class ImageServer:
     # public api
     # --------------------------------------------------------
     def start(self):
-        for camera_topic, camera in self._cameras.items():
+        active = []
+        for cam_topic, camera in self._cameras.items():
             if camera is None:
-                logger_mp.error(f"[Image Server] Camera {camera_topic} failed to initialize previously, cannot start.")
-                self._stop_event.set()
-                self._clean_up()
-                return
-            t = threading.Thread(target=self._update_frames, args=(camera_topic, camera), daemon=True)
+                # 单台相机没起来：只跳过它，其它相机照常推流。
+                logger_mp.error(
+                    f"[Image Server] Camera {cam_topic} failed to initialize; skipping it "
+                    f"(the other cameras keep streaming)."
+                )
+                continue
+            active.append((cam_topic, camera))
+
+        if not active:
+            logger_mp.error("[Image Server] No camera could be initialized; stopping server.")
+            self._stop_event.set()
+            self._clean_up()
+            return
+
+        for cam_topic, camera in active:
+            t = threading.Thread(target=self._update_frames, args=(cam_topic, camera), daemon=True)
             t.start()
             self._publisher_threads.append(t)
         if self._isaacsim_enable:
             time.sleep(2.0)  # wait a bit for IsaacSim shared memory to be ready
 
-        for camera_topic, camera in self._cameras.items():
+        # 推流线程先起来：它们按每台相机的 alive 事件工作，
+        # 相机恢复后不需要重启服务就能继续出帧。
+        for cam_topic, camera in active:
+            if camera.enable_webrtc():
+                t = threading.Thread(target=self._webrtc_pub, args=(cam_topic, camera), daemon=True)
+                t.start()
+                self._publisher_threads.append(t)
+
+            if camera.enable_zmq():
+                t = threading.Thread(target=self._zmq_pub, args=(cam_topic, camera), daemon=True)
+                t.start()
+                self._publisher_threads.append(t)
+
+        ready = 0
+        for cam_topic, camera in active:
             # Use longer timeout for IsaacSim cameras since they need to wait for shared memory data
             if self._isaacsim_enable:
                 timeout = 15.0
             else:
                 timeout = 5.0
-            ready = camera.wait_until_ready(timeout=timeout)
-            if not ready:
-                logger_mp.error(f"[Image Server] {camera_topic} ready timeout after {timeout}s.")
-                self._stop_event.set()
-                self._clean_up()
-            logger_mp.info(f"[Image Server] {camera_topic} is ready.")
-        
-        for camera_topic, camera in self._cameras.items():
-            if camera.enable_webrtc():
-                t = threading.Thread(target=self._webrtc_pub, args=(camera_topic, camera), daemon=True)
-                t.start()
-                self._publisher_threads.append(t)
+            if camera.wait_until_ready(timeout=timeout):
+                logger_mp.info(f"[Image Server] {cam_topic} is ready.")
+                ready += 1
+            else:
+                # 不再因为他一台不出首帧就整服务退出；
+                # 该相机的采集线程会继续退避重试，恢复后自动回到推流。
+                logger_mp.error(
+                    f"[Image Server] {cam_topic} ready timeout after {timeout}s; "
+                    f"serving the remaining cameras without it."
+                )
 
-            if camera.enable_zmq():
-                t = threading.Thread(target=self._zmq_pub, args=(camera_topic, camera), daemon=True)
-                t.start()
-                self._publisher_threads.append(t)
+        if ready == 0:
+            # 不退出：采集线程仍在按退避重试，相机恢复后会自动接上；
+            # 退出只会让 supervisor 反复重启，反而更差。
+            logger_mp.error(
+                "[Image Server] No camera produced a first frame yet; "
+                "keeping the server up and retrying per camera."
+            )
 
     def wait(self):
         self._stop_event.wait()
@@ -1591,9 +1730,12 @@ def main():
     logger_mp.info("[Image Server] Running... Press Ctrl+C to exit.")
     server.wait()
 
-    # usbhub plugout may cause block process exit, no better solution for now
+    # usbhub plugout may cause block process exit, no better solution for now.
+    # 用 os._exit(0) 而不是 killpg(SIGKILL)：退出码为 0，supervisor 能区分
+    # “正常关停”和“被信号杀死”，日志里也不会再出现莫名其妙的 code -9。
     time.sleep(0.5)
-    os.killpg(os.getpgrp(), 9)
+    logger_mp.info("[Image Server] Exiting.")
+    os._exit(0)
 
 if __name__ == "__main__":
     main()
