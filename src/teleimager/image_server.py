@@ -850,6 +850,8 @@ class BaseCamera:
             self._webrtc_buffer = TripleRingBuffer()
         else:
             self._webrtc_buffer = None
+        # WebRTC 帧序号：只有序号变了才编码推送，避免停帧时反复编码旧帧。
+        self._webrtc_seq = 0
 
     def __str__(self):
         raise NotImplementedError
@@ -891,6 +893,15 @@ class BaseCamera:
     def get_bgr_frame(self):
         bgr_numpy = self._webrtc_buffer.read() if self._enable_webrtc and self._webrtc_buffer else None
         return bgr_numpy
+
+    def _write_webrtc_frame(self, bgr_numpy):
+        """写入最新 BGR 帧并递增序号（推流线程靠它去重）。"""
+        self._webrtc_buffer.write(bgr_numpy)
+        self._webrtc_seq += 1
+
+    def get_webrtc_sequence(self):
+        """Return the number of frames written to the WebRTC buffer so far."""
+        return self._webrtc_seq
 
     def get_depth_frame(self):
         """Return a depth frame as bytes, or None if not supported. 
@@ -989,7 +1000,7 @@ class RealSenseCamera(BaseCamera):
         bgr_numpy = np.asanyarray(color_frame.get_data())
 
         if self._enable_webrtc:
-            self._webrtc_buffer.write(bgr_numpy)
+            self._write_webrtc_frame(bgr_numpy)
 
         if self._enable_zmq:
             ok, buf = cv2.imencode(".jpg", bgr_numpy)
@@ -1104,7 +1115,7 @@ class UVCCamera(BaseCamera):
 
                 if self._enable_webrtc:
                     if frame.bgr is not None:
-                        self._webrtc_buffer.write(frame.bgr)
+                        self._write_webrtc_frame(frame.bgr)
 
                 if not self._ready.is_set():
                     self._ready.set()
@@ -1158,7 +1169,7 @@ class OpenCVCamera(BaseCamera):
             ret, bgr_numpy = self.cap.read()
             if ret:
                 if self._enable_webrtc:
-                    self._webrtc_buffer.write(bgr_numpy)
+                    self._write_webrtc_frame(bgr_numpy)
 
                 if self._enable_zmq:
                     ok, buf = cv2.imencode(".jpg", bgr_numpy)
@@ -1243,7 +1254,7 @@ class IsaacSimCamera(BaseCamera):
 
             # For WebRTC: use BGR frames directly
             if self._enable_webrtc:
-                self._webrtc_buffer.write(frame_data)
+                self._write_webrtc_frame(frame_data)
             else:
                 logger_mp.warning(f"[IsaacSimCamera] Failed to encode to WebRTC for {self._cam_topic}")
             if not self._ready.is_set():
@@ -1280,6 +1291,10 @@ class ImageServer:
         # 不触碰全局 _stop_event，因此不会影响其它相机的推流。
         self._alive: dict[str, threading.Event] = {}
         self._alive_lock = threading.Lock()
+        # 自愈线程会动态往 _cameras / _publisher_threads 里加东西，需要加锁。
+        self._cameras_lock = threading.Lock()
+        # 初始化失败的相机每隔这么久重建一次（开机时相机晚上电/晚枚举也能自愈）。
+        self._resurrect_interval = float(os.environ.get("TELEIMAGER_RESURRECT_INTERVAL", "10"))
         if not self._isaacsim_enable:
             self._cam_finder = CameraFinder(realsense_enable, camera_finder_verbose)
         self._responser = ZMQ_Responser(self._cam_config)
@@ -1417,6 +1432,72 @@ class ImageServer:
         with self._alive_lock:
             return self._alive.setdefault(cam_topic, threading.Event())
 
+    def _start_camera_threads(self, cam_topic: str, camera: BaseCamera) -> None:
+        """给一台相机起采集线程 + 推流线程（启动时和自愈重建后共用）。"""
+        threads = [threading.Thread(target=self._update_frames, args=(cam_topic, camera), daemon=True)]
+        if camera.enable_webrtc():
+            threads.append(threading.Thread(target=self._webrtc_pub, args=(cam_topic, camera), daemon=True))
+        if camera.enable_zmq():
+            threads.append(threading.Thread(target=self._zmq_pub, args=(cam_topic, camera), daemon=True))
+        with self._cameras_lock:
+            for thread in threads:
+                thread.start()
+                self._publisher_threads.append(thread)
+
+    def _create_uvc_camera(self, cam_topic: str, cam_cfg: dict):
+        """按配置重建一台 UVC 相机（自愈用）；失败静默返回 None，由调用方限频打日志。"""
+        physical_path = str(cam_cfg.get("physical_path")) if cam_cfg.get("physical_path") else None
+        serial_number = str(cam_cfg.get("serial_number")) if cam_cfg.get("serial_number") else None
+        try:
+            if physical_path is not None:
+                uid = self._cam_finder.get_uid_by_ppath(physical_path)
+                resolver = functools.partial(self._cam_finder.get_uid_by_ppath, physical_path)
+            elif serial_number is not None:
+                uid = self._cam_finder.get_uid_by_sn(serial_number)
+                resolver = functools.partial(self._cam_finder.get_uid_by_sn, serial_number)
+            else:
+                return None
+            if uid is None:
+                return None
+            return UVCCamera(
+                cam_topic, uid,
+                cam_cfg.get("image_shape", None), cam_cfg.get("fps", 30),
+                cam_cfg.get("enable_zmq", False), cam_cfg.get("zmq_port", None),
+                cam_cfg.get("enable_webrtc", False), cam_cfg.get("webrtc_port", None),
+                cam_cfg.get("webrtc_codec", None),
+                uid_resolver=resolver)
+        except Exception:
+            return None
+
+    def _camera_resurrection(self) -> None:
+        """定期重建初始化失败的相机：开机时相机晚上电、USB 晚枚举都能自愈。"""
+        last_warn: dict[str, float] = {}
+        while not self._stop_event.wait(self._resurrect_interval):
+            with self._cameras_lock:
+                pending = [topic for topic, cam in self._cameras.items() if cam is None]
+            for cam_topic in pending:
+                if self._stop_event.is_set():
+                    return
+                cam_cfg = self._cam_config.get(cam_topic) or {}
+                if str(cam_cfg.get("type", "uvc")).lower() != "uvc":
+                    continue
+                camera = self._create_uvc_camera(cam_topic, cam_cfg)
+                if camera is None:
+                    now = time.monotonic()
+                    if now - last_warn.get(cam_topic, 0.0) >= 60.0:
+                        last_warn[cam_topic] = now
+                        logger_mp.warning(
+                            f"[Image Server] {cam_topic} still unavailable; "
+                            f"retrying every {self._resurrect_interval:.0f}s."
+                        )
+                    continue
+                with self._cameras_lock:
+                    if self._cameras.get(cam_topic) is not None:
+                        continue
+                    self._cameras[cam_topic] = camera
+                logger_mp.info(f"[Image Server] {cam_topic} initialised on retry; starting its publishers.")
+                self._start_camera_threads(cam_topic, camera)
+
     def _recover_camera(self, cam_topic: str, camera: BaseCamera) -> bool:
         """退避地尝试把单台相机拉回来。
 
@@ -1526,13 +1607,18 @@ class ImageServer:
         alive = self._alive_for(cam_topic)
         webrtc_codec = camera.get_webrtc_codec()
         next_frame_time = time.monotonic()
+        last_seq = None
 
         while not self._stop_event.is_set():
             try:
                 if alive.is_set():
-                    bgr_frame = camera.get_bgr_frame()
-                    if bgr_frame is not None:
-                        self._webrtc_publisher_manager.publish(bgr_frame, camera.get_webrtc_port(), codec_pref=webrtc_codec)
+                    # 只有采集端写了新帧才编码推送：停帧时不再反复编码旧帧。
+                    sequence = camera.get_webrtc_sequence()
+                    if sequence != last_seq:
+                        bgr_frame = camera.get_bgr_frame()
+                        if bgr_frame is not None:
+                            self._webrtc_publisher_manager.publish(bgr_frame, camera.get_webrtc_port(), codec_pref=webrtc_codec)
+                            last_seq = sequence
             except Exception as e:
                 logger_mp.error(f"[Image Server] webrtc publish error from {cam_topic}: {type(e).__name__}: {e}")
 
@@ -1545,10 +1631,14 @@ class ImageServer:
 
     def _clean_up(self):
         self._responser.stop()
-        for t in self._publisher_threads:
+        with self._cameras_lock:
+            threads = list(self._publisher_threads)
+            cameras = list(self._cameras.values())
+        for t in threads:
             if t.is_alive():
                 t.join(timeout=1.0)
-        self._publisher_threads.clear()
+        with self._cameras_lock:
+            self._publisher_threads.clear()
         
         try:
             self._zmq_publisher_manager.close()
@@ -1559,7 +1649,7 @@ class ImageServer:
         except Exception:
             pass
 
-        for cam in self._cameras.values():
+        for cam in cameras:
             if cam:
                 try:
                     cam.release()
@@ -1588,25 +1678,24 @@ class ImageServer:
             self._clean_up()
             return
 
+        with self._cameras_lock:
+            pending = [topic for topic, cam in self._cameras.items() if cam is None]
+
         for cam_topic, camera in active:
-            t = threading.Thread(target=self._update_frames, args=(cam_topic, camera), daemon=True)
+            self._start_camera_threads(cam_topic, camera)
+
+        # 初始化失败的相机交给自愈线程定期重建，不用重启服务。
+        if pending:
+            t = threading.Thread(target=self._camera_resurrection, daemon=True)
             t.start()
             self._publisher_threads.append(t)
+            logger_mp.info(
+                f"[Image Server] will retry {', '.join(pending)} every "
+                f"{self._resurrect_interval:.0f}s until they come back."
+            )
+
         if self._isaacsim_enable:
             time.sleep(2.0)  # wait a bit for IsaacSim shared memory to be ready
-
-        # 推流线程先起来：它们按每台相机的 alive 事件工作，
-        # 相机恢复后不需要重启服务就能继续出帧。
-        for cam_topic, camera in active:
-            if camera.enable_webrtc():
-                t = threading.Thread(target=self._webrtc_pub, args=(cam_topic, camera), daemon=True)
-                t.start()
-                self._publisher_threads.append(t)
-
-            if camera.enable_zmq():
-                t = threading.Thread(target=self._zmq_pub, args=(cam_topic, camera), daemon=True)
-                t.start()
-                self._publisher_threads.append(t)
 
         ready = 0
         for cam_topic, camera in active:
