@@ -744,11 +744,53 @@ class CameraFinder:
             raise ValueError(f"Multiple cameras found with serial number {serial_number}")
         return matches[0].get("uid")
 
+    def refresh_uvc_enumeration(self) -> bool:
+        """重新枚举 pyuvc / UVC 设备。
+
+        USB 物理插拔后，同一端口的 bus:dev（即 uid）会变；构造时缓存的 uid_map
+        必须刷新，否则 reopen 会一直拿旧 uid 去 open 而失败。
+        """
+        import uvc
+        try:
+            self.uvc_devices = uvc.device_list()
+        except Exception:
+            return False
+        self.uid_map = {dev["uid"]: dev for dev in self.uvc_devices}
+        self.video_paths = self._list_video_paths()
+        self.uvc_rgb_video_paths = self._list_uvc_rgb_video_paths()
+        self.uvc_rgb_video_ids = [int(v.replace("/dev/video", "")) for v in self.uvc_rgb_video_paths]
+        self.uvc_rgb_physical_paths = [self._get_ppath_from_vpath(v) for v in self.uvc_rgb_video_paths]
+        self.uvc_rgb_uids = [self._get_uid_from_ppath(p) for p in self.uvc_rgb_physical_paths]
+        self.uvc_rgb_dev_info = [self.uid_map.get(uid) for uid in self.uvc_rgb_uids]
+        self.uvc_rgb_serial_numbers = [
+            info.get("serialNumber") if info else None for info in self.uvc_rgb_dev_info
+        ]
+        self.uvc_rgb_cameras = {}
+        for vpath, vid, ppath, uid, dev_info, sn in zip(
+            self.uvc_rgb_video_paths,
+            self.uvc_rgb_video_ids,
+            self.uvc_rgb_physical_paths,
+            self.uvc_rgb_uids,
+            self.uvc_rgb_dev_info,
+            self.uvc_rgb_serial_numbers,
+        ):
+            self.uvc_rgb_cameras[vpath] = {
+                "video_id": vid,
+                "physical_path": ppath,
+                "uid": uid,
+                "dev_info": dev_info,
+                "serial_number": sn,
+            }
+        return True
+
     def get_uid_by_ppath(self, physical_path):
         # libusb may claim the interface and remove its /dev/video nodes.
         # Resolve the configured USB port directly, then require that exact UID
         # to be present in pyuvc's enumeration. Never fall back to another camera.
         uid = self._get_uid_from_ppath(physical_path)
+        if uid is not None and uid not in self.uid_map:
+            # 物理插拔后 bus:dev 号变了：先刷新一次枚举，否则会一直拿过期 uid 重开失败
+            self.refresh_uvc_enumeration()
         if uid is not None and uid in self.uid_map:
             return uid
         for cam in self.uvc_rgb_cameras.values():
@@ -1526,11 +1568,11 @@ class ImageServer:
                 last_report = now
                 logger_mp.warning(
                     f"[Image Server] {cam_topic} still unavailable (attempt {attempt}); "
-                    f"retrying with backoff up to 30s. Other cameras are unaffected."
+                    f"retrying every <=5s. Other cameras are unaffected."
                 )
             if self._stop_event.wait(backoff):
                 return False
-            backoff = min(30.0, backoff * 2.0)
+            backoff = min(5.0, backoff * 2.0)
         return False
 
     def _update_frames(self, cam_topic: str, camera: BaseCamera):
