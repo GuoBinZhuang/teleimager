@@ -734,15 +734,22 @@ class CameraFinder:
         return False
     
     def get_uid_by_sn(self, serial_number):
-        matches = [
-            cam for cam in self.uvc_rgb_cameras.values()
-            if cam.get("serial_number") == str(serial_number)
-        ]
-        if not matches:
+        def matches():
+            return [
+                cam for cam in self.uvc_rgb_cameras.values()
+                if cam.get("serial_number") == str(serial_number)
+            ]
+
+        found = matches()
+        if not found:
+            # USB 插拔后缓存可能过期：刷新一次枚举再找
+            self.refresh_uvc_enumeration()
+            found = matches()
+        if not found:
             return None
-        if len(matches) > 1:
+        if len(found) > 1:
             raise ValueError(f"Multiple cameras found with serial number {serial_number}")
-        return matches[0].get("uid")
+        return found[0].get("uid")
 
     def refresh_uvc_enumeration(self) -> bool:
         """重新枚举 pyuvc / UVC 设备。
@@ -1371,11 +1378,13 @@ class ImageServer:
                         if vpath is None:
                             self._cameras[cam_topic] = None
                             logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with physical path {physical_path}")
-                        else:
-                            self._cameras[cam_topic] = self._make_camera(
-                                OpenCVCamera, cam_topic, vpath, img_shape, fps,
-                                enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                            # 指定了 physical_path 就不能再退回 video_id，
+                            # 否则可能误开 /dev/video0（D435i 的节点）。
                             continue
+                        self._cameras[cam_topic] = self._make_camera(
+                            OpenCVCamera, cam_topic, vpath, img_shape, fps,
+                            enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                        continue
 
                     if serial_number is not None:
                         vpath = self._cam_finder.get_vpath_by_sn(serial_number)
@@ -1730,7 +1739,8 @@ class ImageServer:
         if pending:
             t = threading.Thread(target=self._camera_resurrection, daemon=True)
             t.start()
-            self._publisher_threads.append(t)
+            with self._cameras_lock:
+                self._publisher_threads.append(t)
             logger_mp.info(
                 f"[Image Server] will retry {', '.join(pending)} every "
                 f"{self._resurrect_interval:.0f}s until they come back."
@@ -1852,11 +1862,12 @@ def main():
 
     # start image server
     server = ImageServer(cam_config, realsense_enable=args.rs, camera_finder_verbose=False)
-    server.start()
 
-    # graceful shutdown handling
+    # graceful shutdown handling（要在 start() 之前注册：启动阶段最长会等相机就绪~15s）
     signal.signal(signal.SIGINT, functools.partial(signal_handler, server))
     signal.signal(signal.SIGTERM, functools.partial(signal_handler, server))
+
+    server.start()
 
     logger_mp.info("[Image Server] Running... Press Ctrl+C to exit.")
     server.wait()
