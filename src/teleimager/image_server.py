@@ -1085,6 +1085,7 @@ class UVCCamera(BaseCamera):
         self.cap = None
         self._frame_sequence = 0
         self._miss_count = 0
+        self._stuck_closes = 0
         # USB 掉线重枚举后 uid（bus:dev）会变，需要按 physical_path 重新解析。
         self._uid_resolver = uid_resolver
         self._open(uid)
@@ -1130,11 +1131,14 @@ class UVCCamera(BaseCamera):
 
         设备已被拔出时 stop_streaming()/close() 可能永远不返回（原作者因此把
         release() 改成了空实现），所以放到守护线程里执行，超时就放弃（线程随
-        进程退出），只记一条日志。
+        进程退出），只记日志。同一台相机最多留下 2 个卡住的关闭线程，之后只丢句柄。
         """
         cap = self.cap
         self.cap = None
         if cap is None:
+            return
+        if self._stuck_closes >= 2:
+            # 已经有两次关闭卡死：再起线程只会继续堆积，直接放弃这个句柄
             return
 
         def _close() -> None:
@@ -1151,9 +1155,10 @@ class UVCCamera(BaseCamera):
         worker.start()
         worker.join(timeout=timeout)
         if worker.is_alive():
+            self._stuck_closes += 1
             logger_mp.warning(
-                f"[UVCCamera] {self._cam_topic}: old handle still closing after {timeout:.1f}s; "
-                "abandoning it (daemon thread exits with the process)"
+                f"[UVCCamera] {self._cam_topic}: old handle still closing after {timeout:.1f}s "
+                f"(stuck #{self._stuck_closes}); abandoning it"
             )
 
     def get_frame_sequence(self):
@@ -1578,9 +1583,22 @@ class ImageServer:
     def _recover_camera(self, cam_topic: str, camera: BaseCamera) -> bool:
         """退避地尝试把单台相机拉回来。
 
-        返回 False 表示服务正在退出；返回 True 表示设备已重新打开/重新出帧。
-        整个过程只影响这一台相机，其它相机继续推流。
+        先给几次“只重读帧、不重开设备”的机会：pyuvc 的 StreamError 经常是一次性的，
+        直接 close/open 会把画面多打断几秒，重开设备还可能扰动 USB hub（反而更糟）。
+        连续失败后才真正重开设备，并逐步退避。
+        返回 False 表示服务正在退出。
         """
+        for _ in range(3):
+            if self._stop_event.is_set():
+                return False
+            try:
+                camera._update_frame()
+                logger_mp.info(f"[Image Server] {cam_topic} recovered without reopening the device.")
+                return True
+            except Exception:
+                if self._stop_event.wait(0.2):
+                    return False
+
         backoff = 1.0
         attempt = 0
         last_report = 0.0
