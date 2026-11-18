@@ -54,7 +54,7 @@ head_camera:
 
   # if enable_zmq and enable_webrtc are both false, the camera will not start
   # Set to true to enable ZMQ publishing, false to disable
-  # stereo 模式下启用头部双目；d435i 模式由 scripts/set_head_source.sh 关闭。
+  # 2026-10-21: 头部双目未安装 -> 两路均关闭，跳过该相机。
   enable_zmq: true
   # Port to publish camera stream, e.g. zmq tcp://*:55555.  image_client.py should connect to the same port
   zmq_port : 55555

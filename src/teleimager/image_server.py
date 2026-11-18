@@ -1160,6 +1160,10 @@ class UVCCamera(BaseCamera):
                 f"[UVCCamera] {self._cam_topic}: old handle still closing after {timeout:.1f}s "
                 f"(stuck #{self._stuck_closes}); abandoning it"
             )
+        else:
+            # 只统计“连续”卡死：本次正常关闭就把计数清零，避免设备恢复后
+            # 永久放弃关闭句柄（那会变成每次 reopen 都泄漏一个 libusb 句柄）。
+            self._stuck_closes = 0
 
     def get_frame_sequence(self):
         return self._frame_sequence
