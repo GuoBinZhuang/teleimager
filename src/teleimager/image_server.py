@@ -1115,6 +1115,8 @@ class UVCCamera(BaseCamera):
                 logger_mp.error(f"[UVCCamera] {self._cam_topic}: uid re-resolve failed: {e}")
         if uid is None:
             uid = self.uid
+        # 先释放旧句柄再重开：否则每次掉线都泄漏一个 libusb 句柄。
+        self._close_capture()
         try:
             self._open(uid)
         except Exception:
@@ -1122,6 +1124,37 @@ class UVCCamera(BaseCamera):
         self.uid = uid
         self._ready.clear()
         return True
+
+    def _close_capture(self, timeout: float = 2.0) -> None:
+        """尽力关闭 pyuvc 句柄，但绝不允许它把采集线程拖死。
+
+        设备已被拔出时 stop_streaming()/close() 可能永远不返回（原作者因此把
+        release() 改成了空实现），所以放到守护线程里执行，超时就放弃（线程随
+        进程退出），只记一条日志。
+        """
+        cap = self.cap
+        self.cap = None
+        if cap is None:
+            return
+
+        def _close() -> None:
+            for method in ("stop_streaming", "close"):
+                func = getattr(cap, method, None)
+                if func is None:
+                    continue
+                try:
+                    func()
+                except Exception:
+                    pass
+
+        worker = threading.Thread(target=_close, name=f"uvc-close-{self._cam_topic}", daemon=True)
+        worker.start()
+        worker.join(timeout=timeout)
+        if worker.is_alive():
+            logger_mp.warning(
+                f"[UVCCamera] {self._cam_topic}: old handle still closing after {timeout:.1f}s; "
+                "abandoning it (daemon thread exits with the process)"
+            )
 
     def get_frame_sequence(self):
         return self._frame_sequence
@@ -1170,16 +1203,9 @@ class UVCCamera(BaseCamera):
                     self._ready.set()
 
     def release(self):
-        # if usbhub is plugged out, calling stop_streaming and close may hang forever.
-        # try:
-        #     self.cap.stop_streaming()
-        # except Exception:
-        #     pass
-        # try:
-        #     self.cap.close()
-        # except Exception:
-        #     pass
-        # self.cap = None
+        # 原作者注释：usbhub 拔掉时 stop_streaming/close 可能永远不返回。
+        # 现在放到带超时的守护线程里关（见 _close_capture），既能释放句柄又不会卡死。
+        self._close_capture(timeout=1.0)
         logger_mp.info(f"[UVCCamera] Released {self._cam_topic}")
 
 class OpenCVCamera(BaseCamera):
