@@ -1,20 +1,16 @@
-# g1-deploy 分支
+# G1 图传部署分支
 
-这个分支只放 **Unitree G1 三相机部署配置**，基于上游 `v1.5`，不改动任何代码。
+`g1-deploy` 基于上游 `v1.5`，供 G1 三路 USB2 相机使用。采用 libuvc，保留单路故障隔离和重连、UVC 关闭超时保护、慢 WebRTC 客户端隔离。仓库中的 `cam_config_server.yaml` 是部署模板。
 
-- `cam_config_server.yaml`：三路 USB 相机配置（头部双目 + 双腕），`type: uvc`
-- `.gitignore`：补上 `*.log`，避免运行日志被提交
+## 配套版本
 
-## 使用
+`v1.5-g1.3` 搭配采集仓库 `v3.0.1`。从采集仓库安装时固定版本：
 
 ```bash
-git clone -b g1-deploy https://github.com/GuoBinZhuang/teleimager.git ~/gb_workspace/teleimager-1.5
-# 或从已有 v1.5 目录取配置：
-git -C <repo> show g1-deploy:cam_config_server.yaml > cam_config_server.yaml
+TELEIMAGER_REPO=https://github.com/GuoBinZhuang/teleimager.git \
+TELEIMAGER_TAG=v1.5-g1.3 scripts/install_teleimager_1_5.sh
 ```
 
-`physical_path` 是 USB 物理端口，换机器/换口后由
-[g1-mcap-capture](https://github.com/GuoBinZhuang/g1-mcap-capture) 的
-`scripts/sync_camera_paths.py` 按 VID:PID 自动纠正，无需手改。
+相机配置由采集仓库部署，按 VID:PID 同步 `physical_path`。图传由用户单元 `g1-teleimager.service` 管理，日志在 `teleimager_server.log`。排障先用采集仓库的快速自检，空闲时再实测解帧。
 
-> 代码与上游保持一致；升级请切回 `main` 或对应 tag，不要在这个分支上改源码。
+上游通用用法见 [README_zh-CN.md](README_zh-CN.md)。

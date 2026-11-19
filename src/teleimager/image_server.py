@@ -357,11 +357,11 @@ class WebRTC_PublisherThread(threading.Thread):
         pc = RTCPeerConnection()
         self._pcs.add(pc)
 
-        # CORE LOGIC: Use MediaRelay to subscribe
-        # This ensures encoding happens only once globally
+        # Share the frame source. Each sender encodes independently, so a slow
+        # preview consumer keeps only its latest pending frame.
         if self._bgr_track and self._relay:
             try:
-                relayed_track = self._relay.subscribe(self._bgr_track)
+                relayed_track = self._relay.subscribe(self._bgr_track, buffered=False)
                 transceiver = pc.addTransceiver(relayed_track, direction="sendonly")
                 capabilities = RTCRtpSender.getCapabilities("video")
                 pref = (self._codec_pref or "h264").lower()
@@ -1086,6 +1086,7 @@ class UVCCamera(BaseCamera):
         self._frame_sequence = 0
         self._miss_count = 0
         self._stuck_closes = 0
+        self._close_workers = []
         # USB 掉线重枚举后 uid（bus:dev）会变，需要按 physical_path 重新解析。
         self._uid_resolver = uid_resolver
         self._open(uid)
@@ -1137,8 +1138,13 @@ class UVCCamera(BaseCamera):
         self.cap = None
         if cap is None:
             return
-        if self._stuck_closes >= 2:
-            # 已经有两次关闭卡死：再起线程只会继续堆积，直接放弃这个句柄
+        # Reap completed workers even after the limit was reached. Historical
+        # timeouts must not permanently disable closing a recovered device.
+        workers = [worker for worker in self._close_workers if worker.is_alive()]
+        self._close_workers = workers
+        self._stuck_closes = len(workers)
+        if len(workers) >= 2:
+            logger_mp.warning(f"[UVCCamera] {self._cam_topic}: two old handles still closing; skipping another close worker")
             return
 
         def _close() -> None:
@@ -1155,15 +1161,15 @@ class UVCCamera(BaseCamera):
         worker.start()
         worker.join(timeout=timeout)
         if worker.is_alive():
-            self._stuck_closes += 1
+            self._close_workers.append(worker)
+            self._stuck_closes = len(self._close_workers)
             logger_mp.warning(
                 f"[UVCCamera] {self._cam_topic}: old handle still closing after {timeout:.1f}s "
                 f"(stuck #{self._stuck_closes}); abandoning it"
             )
         else:
-            # 只统计“连续”卡死：本次正常关闭就把计数清零，避免设备恢复后
-            # 永久放弃关闭句柄（那会变成每次 reopen 都泄漏一个 libusb 句柄）。
-            self._stuck_closes = 0
+            self._close_workers = [old for old in self._close_workers if old.is_alive()]
+            self._stuck_closes = len(self._close_workers)
 
     def get_frame_sequence(self):
         return self._frame_sequence
